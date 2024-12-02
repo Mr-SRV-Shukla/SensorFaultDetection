@@ -1,9 +1,11 @@
+name: workflow
+
 on:
   push:
     branches:
       - main
     paths-ignore:
-      - "README.md"
+      - 'README.md'
 
 permissions:
   id-token: write
@@ -31,18 +33,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Install Docker
+      - name: Install Utilities
         run: |
           sudo apt-get update
-          sudo apt-get install -y ca-certificates curl gnupg
-          sudo mkdir -p /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-
-      - name: Clean Docker Cache
-        run: docker builder prune -af
+          sudo apt-get install -y jq unzip
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
@@ -55,19 +49,20 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
+      - name: Generate Image Tag
+        id: image-tag
+        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
       - name: Build, tag, and push image to Amazon ECR
-        id: build-image
-        env:
-          IMAGE_TAG: latest
         run: |
-          docker build --progress=plain -t ${{ secrets.AWS_ECR_REPO_URI }}:$IMAGE_TAG .
-          docker push ${{ secrets.AWS_ECR_REPO_URI }}:$IMAGE_TAG
+          docker build -t ${{ secrets.AWS_ECR_REPO_URI }}:${{ env.IMAGE_TAG }} .
+          docker push ${{ secrets.AWS_ECR_REPO_URI }}:${{ env.IMAGE_TAG }}
 
   Continuous-Deployment:
     needs: build-and-push-ecr-image
     runs-on: self-hosted
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v3
 
       - name: Configure AWS credentials
@@ -81,14 +76,20 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Pull latest images
+      - name: Pull and Run Latest Image
         run: |
-          docker pull ${{ secrets.AWS_ECR_REPO_URI }}:latest
+          IMAGE_TAG=${{ env.IMAGE_TAG }}
+          docker pull ${{ secrets.AWS_ECR_REPO_URI }}:$IMAGE_TAG
+          docker run -d -p 8080:8080 --name=sensor \
+            -e 'MONGO_DB_URL=${{ secrets.MONGO_DB_URL }}' \
+            -e 'AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}' \
+            -e 'AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}' \
+            -e 'AWS_DEFAULT_REGION=${{ secrets.AWS_DEFAULT_REGION }}' \
+            ${{ secrets.AWS_ECR_REPO_URI }}:$IMAGE_TAG
 
-      - name: Run Docker Image to serve users
+      - name: Verify Container Status
         run: |
-          docker run -d -p 8080:8080 --name=sensor -e 'MONGO_DB_URL=${{ secrets.MONGO_DB_URL }}' -e 'AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}' -e 'AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}' -e 'AWS_DEFAULT_REGION=${{ secrets.AWS_DEFAULT_REGION }}' ${{ secrets.AWS_ECR_REPO_URI }}:latest
+          docker ps --filter "name=sensor" --format '{{.Status}}' | grep -q "Up" || (echo "Container failed to start"; exit 1)
 
-      - name: Clean previous images and containers
-        run: |
-          docker system prune -f
+      - name: Clean up unused images and containers
+        run: docker system prune --filter "until=24h" -f
